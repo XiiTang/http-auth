@@ -295,6 +295,19 @@ impl DigestClient {
             _ => Err("selected qop was not offered".into()),
         }
     }
+    /// Construct one response with an explicitly offered qop, preserving the
+    /// server offer and the shared nonce count for subsequent requests.
+    pub fn respond_with_qop_protected(
+        &mut self,
+        p: &PasswordParams,
+        selected: Option<Qop>,
+    ) -> Result<DigestResponse, String> {
+        let offered = self.qop;
+        self.select_qop(selected)?;
+        let response = self.respond_protected(p);
+        self.qop = offered;
+        response
+    }
     pub fn respond_protected(&mut self, p: &PasswordParams) -> Result<DigestResponse, String> {
         self.respond_inner(p, &new_random_cnonce())
     }
@@ -1296,6 +1309,36 @@ mod runtime_tests {
             assert!(client.respond_protected(&params).is_err());
             assert_eq!(client.nc, u32::MAX);
         }
+    }
+    #[test]
+    fn per_request_qop_preserves_offer_on_success_and_failure() {
+        let parsed =
+            crate::parse_challenges("Digest realm=\"camera\",nonce=\"n\",qop=\"auth,auth-int\"")
+                .unwrap();
+        let mut client = DigestClient::try_from(&parsed[0]).unwrap();
+        let mut p = PasswordParams {
+            username: "user",
+            password: "secret",
+            method: "PLAY",
+            uri: "rtsp://camera/a",
+            body: None,
+        };
+        assert!(client
+            .respond_with_qop_protected(&p, Some(Qop::AuthInt))
+            .is_err());
+        assert_eq!(client.nonce_count(), 0);
+        let first = client
+            .respond_with_qop_protected(&p, Some(Qop::Auth))
+            .unwrap();
+        assert!(first.authorization.contains("qop=auth,"));
+        p.body = Some(&[0, 255]);
+        let second = client
+            .respond_with_qop_protected(&p, Some(Qop::AuthInt))
+            .unwrap();
+        assert!(second.authorization.contains("qop=auth-int,"));
+        assert_eq!(client.nonce_count(), 2);
+        assert!(client.qop() & Qop::Auth);
+        assert!(client.qop() & Qop::AuthInt);
     }
     #[test]
     fn explicit_qop_and_duplicate_challenges_do_not_silently_fall_back() {
