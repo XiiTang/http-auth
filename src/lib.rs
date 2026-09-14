@@ -480,7 +480,7 @@ impl PasswordClient {
 /// Note that most of these fields are only needed for [`DigestClient`]. Callers
 /// that only care about the `Basic` challenge scheme can use
 /// [`BasicClient::respond`] directly with only username and password.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Copy, Clone, Eq, PartialEq)]
 pub struct PasswordParams<'a> {
     pub username: &'a str,
     pub password: &'a str,
@@ -552,7 +552,7 @@ pub struct PasswordParams<'a> {
 /// parse_challenges("UnsupportedSchemeA, Basic realm=\"foo\", error error").unwrap_err();
 /// ```
 #[inline]
-pub fn parse_challenges(input: &str) -> Result<Vec<ChallengeRef>, parser::Error> {
+pub fn parse_challenges(input: &str) -> Result<Vec<ChallengeRef<'_>>, parser::Error<'_>> {
     parser::ChallengeParser::new(input).collect()
 }
 
@@ -791,5 +791,11 @@ mod tests {
             .to_unescaped(),
             "foobar"
         );
+    }
+}
+
+impl std::fmt::Debug for PasswordParams<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PasswordParams([protected])")
     }
 }

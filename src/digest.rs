@@ -5,6 +5,8 @@
 //! [RFC 7616](https://datatracker.ietf.org/doc/html/rfc7616).
 
 use std::{convert::TryFrom, fmt::Write as _, io::Write as _};
+use unicode_normalization::UnicodeNormalization;
+use zeroize::Zeroizing;
 
 use digest::Digest;
 
@@ -15,7 +17,7 @@ use crate::{
 /// "Quality of protection" value.
 ///
 /// The values here can be used in a bitmask as in [`DigestClient::qop`].
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[repr(u8)]
 #[non_exhaustive]
 pub enum Qop {
@@ -83,8 +85,7 @@ impl std::ops::BitAnd<Qop> for QopSet {
 ///     `Proxy-Authentication-Info` header fields described by [RFC 7616 section
 ///     3.5](https://datatracker.ietf.org/doc/html/rfc7616#section-3.5).
 ///     PRs welcome!
-/// *   Always responds using `UTF-8`, and thus doesn't use or keep around the `charset`
-///     parameter. The RFC only allows that parameter to be set to `UTF-8` anyway.
+/// *   Uses ASCII credentials unless the challenge explicitly declares UTF-8.
 /// *   Supports [RFC 2069](https://datatracker.ietf.org/doc/html/rfc2069) compatibility as in
 ///     [RFC 2617 section 3.2.2.1](https://datatracker.ietf.org/doc/html/rfc2617#section-3.2.2.1),
 ///     even though RFC 7616 drops it. There are still RTSP cameras being sold
@@ -142,6 +143,7 @@ pub struct DigestClient {
     stale: bool,
     rfc2069_compat: bool,
     userhash: bool,
+    utf8: bool,
     qop: QopSet,
     nc: u32,
 }
@@ -240,7 +242,8 @@ impl DigestClient {
     /// `Proxy-Authorization` header value.
     #[inline]
     pub fn respond(&mut self, p: &PasswordParams) -> Result<String, String> {
-        self.respond_inner(p, &new_random_cnonce())
+        self.respond_protected(p)
+            .map(|response| response.authorization.to_string())
     }
 
     /// Responds using a fixed cnonce **for testing only**.
@@ -254,6 +257,7 @@ impl DigestClient {
         cnonce: &str,
     ) -> Result<String, String> {
         self.respond_inner(p, cnonce)
+            .map(|response| response.authorization.to_string())
     }
 
     /// Helper for respond methods.
@@ -261,32 +265,68 @@ impl DigestClient {
     /// We don't simply implement this as `respond_with_testing_cnonce` and have
     /// `respond` delegate to that method because it'd be confusing/alarming if
     /// that method name ever shows up in production stack traces.
-    fn respond_inner(&mut self, p: &PasswordParams, cnonce: &str) -> Result<String, String> {
+    /// Restrict response construction to the explicitly selected offered qop.
+    pub fn select_qop(&mut self, selected: Option<Qop>) -> Result<(), String> {
+        match selected {
+            None if self.rfc2069_compat => Ok(()),
+            Some(qop) if !self.rfc2069_compat && self.qop & qop => {
+                self.qop = QopSet(qop as u8);
+                Ok(())
+            }
+            _ => Err("selected qop was not offered".into()),
+        }
+    }
+    pub fn respond_protected(&mut self, p: &PasswordParams) -> Result<DigestResponse, String> {
+        self.respond_inner(p, &new_random_cnonce())
+    }
+    fn respond_inner(
+        &mut self,
+        p: &PasswordParams,
+        cnonce: &str,
+    ) -> Result<DigestResponse, String> {
+        if !self.utf8 && (!p.username.is_ascii() || !p.password.is_ascii()) {
+            return Err("non-ASCII credentials require an explicit UTF-8 challenge".into());
+        }
+        let username = Zeroizing::new(if self.utf8 {
+            p.username.nfc().collect::<String>()
+        } else {
+            p.username.to_owned()
+        });
+        let password = Zeroizing::new(if self.utf8 {
+            p.password.nfc().collect::<String>()
+        } else {
+            p.password.to_owned()
+        });
         let realm = self.realm();
-        let mut h_a1 = self.algorithm.h(&[
-            p.username.as_bytes(),
+        let mut h_a1 = Zeroizing::new(self.algorithm.h(&[
+            username.as_bytes(),
             b":",
             realm.as_bytes(),
             b":",
-            p.password.as_bytes(),
-        ]);
+            password.as_bytes(),
+        ]));
         if self.session {
-            h_a1 = self.algorithm.h(&[
+            h_a1 = Zeroizing::new(self.algorithm.h(&[
                 h_a1.as_bytes(),
                 b":",
                 self.nonce().as_bytes(),
                 b":",
                 cnonce.as_bytes(),
-            ]);
+            ]));
         }
 
         // Select the best available qop and calculate H(A2) as in
         // [https://datatracker.ietf.org/doc/html/rfc7616#section-3.4.3].
         let (h_a2, qop);
         if let (Some(body), true) = (p.body, self.qop & Qop::AuthInt) {
-            h_a2 = self
-                .algorithm
-                .h(&[p.method.as_bytes(), b":", p.uri.as_bytes(), b":", body]);
+            let body_hash = Zeroizing::new(self.algorithm.h(&[body]));
+            h_a2 = self.algorithm.h(&[
+                p.method.as_bytes(),
+                b":",
+                p.uri.as_bytes(),
+                b":",
+                body_hash.as_bytes(),
+            ]);
             qop = Qop::AuthInt;
         } else if self.qop & Qop::Auth {
             h_a2 = self
@@ -306,7 +346,7 @@ impl DigestClient {
         };
 
         // https://datatracker.ietf.org/doc/html/rfc2617#section-3.2.2.1
-        let response = if self.rfc2069_compat {
+        let response = Zeroizing::new(if self.rfc2069_compat {
             self.algorithm.h(&[
                 h_a1.as_bytes(),
                 b":",
@@ -328,20 +368,20 @@ impl DigestClient {
                 b":",
                 h_a2.as_bytes(),
             ])
-        };
+        });
 
-        let mut out = String::with_capacity(128);
+        let mut out = Zeroizing::new(String::with_capacity(128));
         out.push_str("Digest ");
         if self.userhash {
             let hashed = self
                 .algorithm
-                .h(&[p.username.as_bytes(), b":", realm.as_bytes()]);
+                .h(&[username.as_bytes(), b":", realm.as_bytes()]);
             append_quoted_key_value(&mut out, "username", &hashed)?;
             append_unquoted_key_value(&mut out, "userhash", "true");
-        } else if is_valid_quoted_value(p.username) {
-            append_quoted_key_value(&mut out, "username", p.username)?;
+        } else if is_valid_quoted_value(&username) {
+            append_quoted_key_value(&mut out, "username", &username)?;
         } else {
-            append_extended_key_value(&mut out, "username", p.username);
+            append_extended_key_value(&mut out, "username", &username);
         }
         append_quoted_key_value(&mut out, "realm", self.realm())?;
         append_quoted_key_value(&mut out, "uri", p.uri)?;
@@ -356,9 +396,27 @@ impl DigestClient {
         if let Some(o) = self.opaque() {
             append_quoted_key_value(&mut out, "opaque", o)?;
         }
-        out.truncate(out.len() - 2); // remove final ", "
+        if self.rfc2069_compat && (self.session || self.algorithm != Algorithm::Md5) {
+            append_unquoted_key_value(&mut out, "algorithm", self.algorithm.as_str(self.session));
+        }
+        if self.rfc2069_compat && self.session {
+            append_quoted_key_value(&mut out, "cnonce", cnonce)?;
+        }
+        let length = out.len() - 2;
+        out.truncate(length);
         self.nc = nc;
-        Ok(out)
+        Ok(DigestResponse {
+            authorization: out,
+            proof: ServerProof {
+                algorithm: self.algorithm,
+                h_a1,
+                nonce: Zeroizing::new(self.nonce().to_owned()),
+                cnonce: Zeroizing::new(cnonce.to_owned()),
+                nc,
+                uri: Zeroizing::new(p.uri.to_owned()),
+                qop: if self.rfc2069_compat { None } else { Some(qop) },
+            },
+        })
     }
 }
 
@@ -382,10 +440,27 @@ impl TryFrom<&ChallengeRef<'_>> for DigestClient {
         let mut algorithm_and_session = None;
         let mut qop_str = None;
         let mut userhash_str = None;
+        let mut selectors = std::collections::HashSet::new();
+        let mut utf8 = false;
 
         // Parse response header field parameters as in
         // [https://datatracker.ietf.org/doc/html/rfc7616#section-3.3].
         for (k, v) in &value.params {
+            if !selectors.insert(k.to_ascii_lowercase()) {
+                return Err("duplicate digest parameter".into());
+            }
+            if k.eq_ignore_ascii_case("charset") {
+                utf8 = true;
+            }
+            if k.eq_ignore_ascii_case("charset") && !v.escaped.eq_ignore_ascii_case("UTF-8") {
+                return Err("unsupported digest charset".into());
+            }
+            if (k.eq_ignore_ascii_case("stale") || k.eq_ignore_ascii_case("userhash"))
+                && !v.escaped.eq_ignore_ascii_case("true")
+                && !v.escaped.eq_ignore_ascii_case("false")
+            {
+                return Err("invalid digest boolean".into());
+            }
             // Note that "stale" and "algorithm" can be directly compared
             // without unescaping because RFC 7616 section 3.3 says "For
             // historical reasons, a sender MUST NOT generate the quoted string
@@ -468,6 +543,7 @@ impl TryFrom<&ChallengeRef<'_>> for DigestClient {
             stale,
             rfc2069_compat,
             userhash,
+            utf8,
             qop,
             nc: 0,
         })
@@ -913,5 +989,317 @@ mod tests {
             dbg!(std::mem::size_of::<DigestClient>()),
             dbg!(std::mem::size_of::<Option<DigestClient>>()),
         )
+    }
+}
+
+/// One protected request and its response-verification context. Neither Debug
+/// nor serialization exposes the authorization, password hash or nonce proof.
+pub struct DigestResponse {
+    pub authorization: Zeroizing<String>,
+    pub proof: ServerProof,
+}
+pub struct ServerProof {
+    algorithm: Algorithm,
+    h_a1: Zeroizing<String>,
+    nonce: Zeroizing<String>,
+    cnonce: Zeroizing<String>,
+    nc: u32,
+    uri: Zeroizing<String>,
+    qop: Option<Qop>,
+}
+impl ServerProof {
+    /// Verify Authentication-Info against this exact request and received body.
+    /// nextnonce is returned as private protocol state; it is never applied here.
+    pub fn verify(&self, value: &str, body: &[u8]) -> Result<Option<String>, String> {
+        use subtle::ConstantTimeEq;
+        let input = Zeroizing::new(format!("Digest {}", value));
+        let parsed = crate::parse_challenges(&input).map_err(|_| "invalid authentication-info")?;
+        if parsed.len() != 1 {
+            return Err("ambiguous authentication-info".into());
+        }
+        let mut fields = std::collections::HashMap::new();
+        for (key, value) in &parsed[0].params {
+            if fields
+                .insert(
+                    key.to_ascii_lowercase(),
+                    Zeroizing::new(value.to_unescaped()),
+                )
+                .is_some()
+            {
+                return Err("duplicate authentication-info parameter".into());
+            }
+        }
+        let get = |name: &str| {
+            fields
+                .get(name)
+                .map(|v| v.as_str())
+                .ok_or("missing authentication-info parameter")
+        };
+        if let Some(qop) = self.qop {
+            if get("qop")? != qop.as_str()
+                || get("nc")? != format!("{:08x}", self.nc)
+                || get("cnonce")? != self.cnonce.as_str()
+            {
+                return Err("authentication-info does not match the request".into());
+            }
+        } else if fields.contains_key("qop")
+            || fields.contains_key("nc")
+            || fields.contains_key("cnonce")
+        {
+            return Err("unexpected authentication-info qop".into());
+        }
+        let a2 = Zeroizing::new(match self.qop {
+            Some(Qop::AuthInt) => {
+                let body_hash = Zeroizing::new(self.algorithm.h(&[body]));
+                self.algorithm
+                    .h(&[b":", self.uri.as_bytes(), b":", body_hash.as_bytes()])
+            }
+            _ => self.algorithm.h(&[b":", self.uri.as_bytes()]),
+        });
+        let expected = Zeroizing::new(match self.qop {
+            Some(qop) => self.algorithm.h(&[
+                self.h_a1.as_bytes(),
+                b":",
+                self.nonce.as_bytes(),
+                b":",
+                format!("{:08x}", self.nc).as_bytes(),
+                b":",
+                self.cnonce.as_bytes(),
+                b":",
+                qop.as_str().as_bytes(),
+                b":",
+                a2.as_bytes(),
+            ]),
+            None => self.algorithm.h(&[
+                self.h_a1.as_bytes(),
+                b":",
+                self.nonce.as_bytes(),
+                b":",
+                a2.as_bytes(),
+            ]),
+        });
+        let received = Zeroizing::new(hex::decode(get("rspauth")?).map_err(|_| "invalid rspauth")?);
+        let expected =
+            Zeroizing::new(hex::decode(expected.as_str()).map_err(|_| "invalid expected rspauth")?);
+        if received.len() != expected.len() || !bool::from(received.ct_eq(&expected)) {
+            return Err("rspauth mismatch".into());
+        }
+        Ok(fields.get("nextnonce").map(|value| value.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod runtime_tests {
+    use super::*;
+    // Independently generated with Python hashlib for all RFC 7616 hashes,
+    // session variants, and qop modes; request/response bodies are binary.
+    #[test]
+    fn binary_integrity_session_variants_and_server_proofs() {
+        let vectors = [
+            (
+                "MD5",
+                None,
+                "e199d75235f96fde73108ca54db65ec6",
+                "813d5f74cbc2d11ff7903a6add0b318e",
+            ),
+            (
+                "MD5",
+                Some(Qop::Auth),
+                "b8b01581d5a531ccde1afd3afc6c63f9",
+                "c519f1e321f470bf48167692dfbe9a96",
+            ),
+            (
+                "MD5",
+                Some(Qop::AuthInt),
+                "a28f59162314fb9344cc50ba2d30b6d3",
+                "089d9a9f8ad52444a737200a79276439",
+            ),
+            (
+                "MD5-sess",
+                None,
+                "434a160394171017b12ad07cb1ae63a3",
+                "5ec0953fe78ff2c6f0e6b254b7fc443d",
+            ),
+            (
+                "MD5-sess",
+                Some(Qop::Auth),
+                "0e652557b0d2a1575a71e71f93c59b66",
+                "5678ec9fe21f20f1daf326f8d5424627",
+            ),
+            (
+                "MD5-sess",
+                Some(Qop::AuthInt),
+                "d4daa8d0c83d65e4a7b6bb64c03ccf9f",
+                "269359c69134a49bdf1311fd7b61f573",
+            ),
+            (
+                "SHA-256",
+                None,
+                "4e9a4d81293c43b8edb3f6f7113db636134a871ef6ba7876e503a6d9275c6d69",
+                "8aac29544060ff89452e0fb51b02705901fb8ff048df84817a885c00e7027552",
+            ),
+            (
+                "SHA-256",
+                Some(Qop::Auth),
+                "c5c9ad7df4be39a2eee1a6e64addecdef95d210c4dc14dd933ffea2fc33cd7ef",
+                "767f87ac829f806a4cbbc246c44ec5d9937939607e84cb8e63f2b7813ea91f01",
+            ),
+            (
+                "SHA-256",
+                Some(Qop::AuthInt),
+                "c6678f7f9551f2093a9bbfbd9dbd6d0d6479d14f40c9640a76202c8c796a774e",
+                "54f9bc5d52edfab3f4e4d5f689f6baf9c79f59d5c70a0f4b2533c69663ffa703",
+            ),
+            (
+                "SHA-256-sess",
+                None,
+                "5feed50c3134bf37a035b4efc2965d987311866f863ab22fb4105426aa68c8b0",
+                "d47e48816967c8ee98211f8b0ef8ff4c843744e4af016516779f4073723ccb49",
+            ),
+            (
+                "SHA-256-sess",
+                Some(Qop::Auth),
+                "5e19814d2c0d67d9860496cb7ff6d47be4c7cbed72cad9c99d0bd63ab8d39808",
+                "dc82d43716a79382f06079945d9f984b3ad2e66bcdf9256c17bcb82324541245",
+            ),
+            (
+                "SHA-256-sess",
+                Some(Qop::AuthInt),
+                "8acecb0f8579220c820455b5e0a1d101ad42a90c7299faba7097afdfd8b8bf7b",
+                "a4cf3b5311aa069a5d0aab1600458d8b5d8c18de287fd3816d33050a18b04c5b",
+            ),
+            (
+                "SHA-512-256",
+                None,
+                "94ef20a12aab79231b1b197c3341e251c37e617f596b4c4b4450b6408fd70c47",
+                "d3c2d57deea1a117db900d9913a9994da1b4e89ef87bad5e853b4179c3abaa22",
+            ),
+            (
+                "SHA-512-256",
+                Some(Qop::Auth),
+                "cd30d4c398e6da752b02ca3a9eb3e5c959c9a38ba025e596a780e154502e8d1b",
+                "54662ed6a3425c2e641b19a6f5dd00bbece5f4c373a9ba7dbec26614567e0d1c",
+            ),
+            (
+                "SHA-512-256",
+                Some(Qop::AuthInt),
+                "ace6e59c939fa65dd2767a8c8f7eac5cf5a47bc0853c671c236bd610af947c11",
+                "1f2406f3f5598a8e0c6793544d12c338ffb26d6cfad7c0968feeba0e8b8bca9b",
+            ),
+            (
+                "SHA-512-256-sess",
+                None,
+                "76cf0f9cddb4d2fcca62e8018ff8dd4dc6324a51876862360eefa3c3abc62c11",
+                "4b7563abb21f001f31b46a9ea969e196bbc93fb825453b5e8f05b1bbdf939534",
+            ),
+            (
+                "SHA-512-256-sess",
+                Some(Qop::Auth),
+                "4872eaec52281923295e4c7f603a70ef918e465e99275f75072f8ea04d04fc04",
+                "8f1ee98f79ea8831203a0e4c8b9b45a9fec56fa5c9d7136c48a318bee7656d48",
+            ),
+            (
+                "SHA-512-256-sess",
+                Some(Qop::AuthInt),
+                "107ced56c55edc5cc8940e7ab0cd8601415ca3e177400914b395df9d04ed04e4",
+                "ccbbdec532b6545d152e04ea563e5692785f9800459446807de419bf702376f0",
+            ),
+        ];
+        for (algorithm, qop, request_hash, response_hash) in vectors {
+            let mut challenge = format!(
+                "Digest realm=\"camera\", nonce=\"nonce-1\", algorithm={}",
+                algorithm
+            );
+            if let Some(qop) = qop {
+                challenge.push_str(&format!(", qop=\"{}\"", qop.as_str()));
+            }
+            let parsed = crate::parse_challenges(&challenge).unwrap();
+            let mut client = DigestClient::try_from(&parsed[0]).unwrap();
+            client.select_qop(qop).unwrap();
+            let params = PasswordParams {
+                username: "user",
+                password: "p:ass",
+                method: "SET_PARAMETER",
+                uri: "rtsp://camera.invalid/media",
+                body: Some(&[0, 255, 1, 13, 10]),
+            };
+            let response = client.respond_inner(&params, "c0ffee").unwrap();
+            let parsed = crate::parse_challenges(&response.authorization).unwrap();
+            assert_eq!(
+                parsed[0]
+                    .params
+                    .iter()
+                    .find(|(key, _)| *key == "response")
+                    .unwrap()
+                    .1
+                    .to_unescaped(),
+                request_hash,
+                "{} {:?}",
+                algorithm,
+                qop
+            );
+            if algorithm.ends_with("-sess") {
+                assert!(response.authorization.contains("cnonce=\"c0ffee\""));
+                assert!(response
+                    .authorization
+                    .contains(&format!("algorithm={}", algorithm)));
+            }
+            let mut info = format!("rspauth=\"{}\", nextnonce=\"next-2\"", response_hash);
+            if let Some(qop) = qop {
+                info.push_str(&format!(
+                    ", qop={}, nc=00000001, cnonce=\"c0ffee\"",
+                    qop.as_str()
+                ));
+            }
+            assert_eq!(
+                response
+                    .proof
+                    .verify(&info, &[9, 0, 128])
+                    .unwrap()
+                    .as_deref(),
+                Some("next-2")
+            );
+            if qop == Some(Qop::AuthInt) {
+                assert!(response.proof.verify(&info, &[9, 0, 129]).is_err());
+            }
+            assert!(response
+                .proof
+                .verify(&info.replace(response_hash, "00"), &[9, 0, 128])
+                .is_err());
+            assert_eq!(client.nonce_count(), 1);
+            assert_eq!(client.nonce(), "nonce-1");
+            client.nc = u32::MAX;
+            assert!(client.respond_protected(&params).is_err());
+            assert_eq!(client.nc, u32::MAX);
+        }
+    }
+    #[test]
+    fn explicit_qop_and_duplicate_challenges_do_not_silently_fall_back() {
+        let parsed =
+            crate::parse_challenges("Digest realm=\"camera\",nonce=\"n\",qop=\"auth,auth-int\"")
+                .unwrap();
+        let mut client = DigestClient::try_from(&parsed[0]).unwrap();
+        assert!(client.select_qop(None).is_err());
+        client.select_qop(Some(Qop::AuthInt)).unwrap();
+        assert!(client.select_qop(Some(Qop::Auth)).is_err());
+        let p = PasswordParams {
+            username: "user",
+            password: "secret",
+            method: "GET",
+            uri: "/",
+            body: None,
+        };
+        assert!(client.respond_protected(&p).is_err());
+        assert_eq!(client.nc, 0);
+        for suffix in [
+            ", algorithm=MD5, Algorithm=SHA-256",
+            ", stale=true, STALE=false",
+            ", charset=unsupported",
+            ", userhash=maybe",
+        ] {
+            let header = format!("Digest realm=\"camera\",nonce=\"n\"{}", suffix);
+            let parsed = crate::parse_challenges(&header).unwrap();
+            assert!(DigestClient::try_from(&parsed[0]).is_err());
+        }
     }
 }
