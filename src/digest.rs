@@ -149,6 +149,25 @@ pub struct DigestClient {
 }
 
 impl DigestClient {
+    /// Replace the server nonce only after the caller has authenticated the
+    /// Authentication-Info that supplied it. The same nonce retains its count.
+    pub fn adopt_verified_nonce(&mut self, nonce: &str) -> Result<(), String> {
+        if nonce.is_empty()
+            || !is_valid_quoted_value(nonce)
+            || usize::from(self.nonce_start) + nonce.len() > usize::from(u16::MAX)
+        {
+            return Err("invalid next nonce".into());
+        }
+        if nonce == self.nonce() {
+            return Ok(());
+        }
+        let mut value = String::with_capacity(usize::from(self.nonce_start) + nonce.len());
+        value.push_str(&self.buf[..usize::from(self.nonce_start)]);
+        value.push_str(nonce);
+        self.buf = value.into_boxed_str();
+        self.nc = 0;
+        Ok(())
+    }
     /// Returns a string to be displayed to users so they know which username
     /// and password to use.
     ///
@@ -1268,6 +1287,11 @@ mod runtime_tests {
                 .is_err());
             assert_eq!(client.nonce_count(), 1);
             assert_eq!(client.nonce(), "nonce-1");
+            client.adopt_verified_nonce("nonce-1").unwrap();
+            assert_eq!(client.nonce_count(), 1);
+            client.adopt_verified_nonce("next-2").unwrap();
+            assert_eq!(client.nonce_count(), 0);
+            assert_eq!(client.realm(), "camera");
             client.nc = u32::MAX;
             assert!(client.respond_protected(&params).is_err());
             assert_eq!(client.nc, u32::MAX);
