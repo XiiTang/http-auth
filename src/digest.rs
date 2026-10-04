@@ -462,6 +462,9 @@ impl TryFrom<&ChallengeRef<'_>> for DigestClient {
                 value.scheme
             ));
         }
+        if value.token68.is_some() {
+            return Err("digest challenge carries a token68".into());
+        }
         let mut buf_len = 0;
         let mut unused_len = 0;
         let mut realm = None;

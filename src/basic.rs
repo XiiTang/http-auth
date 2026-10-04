@@ -106,6 +106,9 @@ impl TryFrom<&ChallengeRef<'_>> for BasicClient {
                 value.scheme
             ));
         }
+        if value.token68.is_some() {
+            return Err("basic challenge carries a token68".into());
+        }
         let mut realm = None;
         let mut utf8 = false;
         let mut seen = std::collections::HashSet::new();

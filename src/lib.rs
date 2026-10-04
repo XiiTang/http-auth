@@ -111,8 +111,8 @@ use crate::table::C_ATTR;
 /// challenge scheme. In most cases, callers should construct a [`PasswordClient`]
 /// without directly using `ChallengeRef`.
 ///
-/// Only supports the param form, not the apocryphal `token68` form, as described
-/// in [`crate::parser::ChallengeParser`].
+/// Holds either parameters or a `token68`, as described in
+/// [`crate::parser::ChallengeParser`].
 #[derive(Clone, Eq, PartialEq)]
 pub struct ChallengeRef<'i> {
     /// The scheme name, which should be compared case-insensitively.
@@ -126,6 +126,10 @@ pub struct ChallengeRef<'i> {
     /// parameter types, it's more efficient in terms of CPU usage and code size
     /// to scan through them directly.
     pub params: Vec<ChallengeParamRef<'i>>,
+
+    /// The challenge's `token68`, when it carries one instead of parameters,
+    /// as a `Negotiate` reply does.
+    pub token68: Option<&'i str>,
 }
 
 impl<'i> ChallengeRef<'i> {
@@ -133,6 +137,7 @@ impl<'i> ChallengeRef<'i> {
         ChallengeRef {
             scheme,
             params: Vec::new(),
+            token68: None,
         }
     }
 }
@@ -142,6 +147,7 @@ impl<'i> std::fmt::Debug for ChallengeRef<'i> {
         f.debug_struct("ChallengeRef")
             .field("scheme", &self.scheme)
             .field("params", &ParamsPrinter(&self.params))
+            .field("token68", &self.token68.map(|_| "<token68>"))
             .finish()
     }
 }
@@ -540,16 +546,18 @@ pub struct PasswordParams<'a> {
 ///         ChallengeRef {
 ///             scheme: "UnsupportedSchemeA",
 ///             params: vec![],
+///             token68: None,
 ///         },
 ///         ChallengeRef {
 ///             scheme: "Basic",
 ///             params: vec![("realm", ParamValue::try_from_escaped("foo").unwrap())],
+///             token68: None,
 ///         },
 ///     ],
 /// );
 ///
 /// // Returns `Err` if there is a syntax error anywhere in the input.
-/// parse_challenges("UnsupportedSchemeA, Basic realm=\"foo\", error error").unwrap_err();
+/// parse_challenges("UnsupportedSchemeA, Basic realm=\"foo\", error error error").unwrap_err();
 /// ```
 #[inline]
 pub fn parse_challenges(input: &str) -> Result<Vec<ChallengeRef<'_>>, parser::Error<'_>> {

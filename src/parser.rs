@@ -42,17 +42,19 @@ macro_rules! trace {
 ///
 /// ```rust
 /// use http_auth::{parser::ChallengeParser, ChallengeRef, ParamValue};
-/// let challenges = "UnsupportedSchemeA, Basic realm=\"foo\", error error";
+/// let challenges = "UnsupportedSchemeA, Basic realm=\"foo\", error error error";
 /// let mut parser = ChallengeParser::new(challenges);
 /// let c = parser.next().unwrap().unwrap();
 /// assert_eq!(c, ChallengeRef {
 ///     scheme: "UnsupportedSchemeA",
 ///     params: vec![],
+///     token68: None,
 /// });
 /// let c = parser.next().unwrap().unwrap();
 /// assert_eq!(c, ChallengeRef {
 ///     scheme: "Basic",
 ///     params: vec![("realm", ParamValue::try_from_escaped("foo").unwrap())],
+///     token68: None,
 /// });
 /// let c = parser.next().unwrap().unwrap_err();
 /// ```
@@ -67,22 +69,14 @@ macro_rules! trace {
 ///     3.2.6](https://datatracker.ietf.org/doc/html/rfc7230#section-3.2.6),
 ///     which allows these via `obs-text`, but the meaning is ill-defined in
 ///     the context of RFC 7235.
-/// *   Doesn't allow `token68`, which as far as I know has never been and will
-///     never be used in a `challenge`:
-///     *   [RFC 2617](https://datatracker.ietf.org/doc/html/rfc2617) never
-///         allowed `token68` for challenges.
-///     *   [RFC 7235 Appendix
-///         A](https://datatracker.ietf.org/doc/html/rfc7235#appendix-A) says
-///         `token68` "was added for consistency with legacy authentication
-///         schemes such as `Basic`", but `Basic` only uses `token68` in
-///         `credential`, not `challenge`.
-///     *   [RFC 7235 section
-///         5.1.2](https://datatracker.ietf.org/doc/html/rfc7235#section-5.1.2)
-///         says "new schemes ought to use the `auth-param` syntax instead
-///         [of `token68`], because otherwise future extensions will be
-///         impossible."
-///     *   No scheme in the [registry](https://www.iana.org/assignments/http-authschemes/http-authschemes.xhtml)
-///         uses `token68` challenges as of 2021-10-19.
+/// *   Reads a `token68` as [RFC 9110 section
+///     11.6.1](https://www.rfc-editor.org/rfc/rfc9110#section-11.6.1) allows
+///     it: the first and only element after the scheme and one space, followed
+///     by OWS, a comma or the end. `Negotiate` replies carry one ([RFC 4559
+///     section 4](https://www.rfc-editor.org/rfc/rfc4559#section-4)), often in
+///     the same field as other challenges. Where the grammar is ambiguous, as
+///     `x=` could start a parameter, the parameter is taken when a value
+///     follows.
 pub struct ChallengeParser<'i> {
     input: &'i str,
     pos: usize,
@@ -206,6 +200,14 @@ enum State<'i> {
         value_start: usize,
     },
 
+    /// A challenge's `token68`, from `start`; `equals` once its trailing `=`
+    /// padding began.
+    Token68 {
+        challenge: ChallengeRef<'i>,
+        start: usize,
+        equals: bool,
+    },
+
     /// Transitioned from `Equals` on initial `"`.
     ParamQuotedValue {
         challenge: ChallengeRef<'i>,
@@ -303,7 +305,47 @@ impl<'i> Iterator for ChallengeParser<'i> {
                             }
                         }
                     } else {
+                        let first = first_element(challenge.as_ref(), cur);
                         match b {
+                            // The first element after a scheme continues as a
+                            // token68 at a character only token68 allows.
+                            b'/' if first
+                                && token_pos.end == self.pos
+                                && is_token68(&self.input[token_pos.clone()]) =>
+                            {
+                                self.state = State::Token68 {
+                                    challenge: challenge.expect("first element has a challenge"),
+                                    start: token_pos.start,
+                                    equals: false,
+                                };
+                            }
+                            // A scheme, one space, then a token68 starting with one.
+                            b'/' if (cur.0 & P_SCHEME) != 0
+                                && token_pos.end != self.pos
+                                && &self.input[token_pos.end..self.pos] == " " =>
+                            {
+                                self.state = State::Token68 {
+                                    challenge: ChallengeRef::new(&self.input[token_pos]),
+                                    start: self.pos,
+                                    equals: false,
+                                };
+                                if let Some(c) = challenge {
+                                    self.pos += 1;
+                                    return Some(Ok(c));
+                                }
+                            }
+                            // A first element without `=` before the comma is a token68.
+                            b',' if first && is_token68(&self.input[token_pos.clone()]) => {
+                                let mut challenge =
+                                    challenge.expect("first element has a challenge");
+                                challenge.token68 = Some(&self.input[token_pos]);
+                                self.state = State::PreToken {
+                                    challenge: Some(challenge),
+                                    next: Possibilities(
+                                        P_SCHEME | P_WHITESPACE | P_EOF | P_COMMA_EOF,
+                                    ),
+                                };
+                            }
                             b',' if (cur.0 & P_SCHEME) != 0 => {
                                 self.state = State::PreToken {
                                     challenge: Some(ChallengeRef::new(&self.input[token_pos])),
@@ -344,9 +386,25 @@ impl<'i> Iterator for ChallengeParser<'i> {
                         }
                     }
                 }
-                State::PostEquals { challenge, key_pos } => {
+                State::PostEquals {
+                    mut challenge,
+                    key_pos,
+                } => {
                     trace!("PostEquals pos={} b={:?}", self.pos, char::from(b));
-                    if (classes & C_OWS) != 0 {
+                    let token68 = token68_padding(self.input, &challenge, &key_pos);
+                    if b == b'=' && token68 && self.pos == key_pos.end + 1 {
+                        self.state = State::Token68 {
+                            challenge,
+                            start: key_pos.start,
+                            equals: true,
+                        };
+                    } else if b == b',' && token68 {
+                        challenge.token68 = Some(&self.input[key_pos.start..key_pos.end + 1]);
+                        self.state = State::PreToken {
+                            challenge: Some(challenge),
+                            next: Possibilities(P_SCHEME | P_WHITESPACE | P_EOF | P_COMMA_EOF),
+                        };
+                    } else if (classes & C_OWS) != 0 {
                         // Note this doesn't advance key_pos.end, so in the token68 case, another
                         // `=` will not be allowed.
                         self.state = State::PostEquals { challenge, key_pos };
@@ -363,6 +421,32 @@ impl<'i> Iterator for ChallengeParser<'i> {
                             challenge,
                             key_pos,
                             value_start: self.pos,
+                        };
+                    } else {
+                        return Some(Err(Error::invalid_byte(self.input, self.pos)));
+                    }
+                }
+                State::Token68 {
+                    mut challenge,
+                    start,
+                    equals,
+                } => {
+                    trace!("Token68 pos={} b={:?}", self.pos, char::from(b));
+                    if b == b'=' || (!equals && is_token68(&self.input[self.pos..self.pos + 1])) {
+                        self.state = State::Token68 {
+                            challenge,
+                            start,
+                            equals: equals || b == b'=',
+                        };
+                    } else if (classes & C_OWS) != 0 || b == b',' {
+                        challenge.token68 = Some(&self.input[start..self.pos]);
+                        self.state = State::PreToken {
+                            challenge: Some(challenge),
+                            next: Possibilities(if b == b',' {
+                                P_SCHEME | P_WHITESPACE | P_EOF | P_COMMA_EOF
+                            } else {
+                                P_WHITESPACE | P_COMMA_EOF
+                            }),
                         };
                     } else {
                         return Some(Err(Error::invalid_byte(self.input, self.pos)));
@@ -494,6 +578,14 @@ impl<'i> Iterator for ChallengeParser<'i> {
                 cur,
             } => {
                 trace!("eof, Token({:?})", cur);
+                if first_element(challenge.as_ref(), cur)
+                    && token_pos.end == self.input.len()
+                    && is_token68(&self.input[token_pos.clone()])
+                {
+                    let mut challenge = challenge.expect("first element has a challenge");
+                    challenge.token68 = Some(&self.input[token_pos]);
+                    return Some(Ok(challenge));
+                }
                 if (cur.0 & P_SCHEME) == 0 {
                     return Some(Err(Error {
                         input: self.input,
@@ -517,6 +609,25 @@ impl<'i> Iterator for ChallengeParser<'i> {
                     return Some(Ok(challenge));
                 }
                 return Some(Ok(ChallengeRef::new(&self.input[token_pos])));
+            }
+            State::PostEquals {
+                mut challenge,
+                key_pos,
+            } if token68_padding(self.input, &challenge, &key_pos)
+                && key_pos.end + 1 == self.input.len() =>
+            {
+                trace!("eof, PostEquals as token68");
+                challenge.token68 = Some(&self.input[key_pos.start..key_pos.end + 1]);
+                return Some(Ok(challenge));
+            }
+            State::Token68 {
+                mut challenge,
+                start,
+                ..
+            } => {
+                trace!("eof, Token68");
+                challenge.token68 = Some(&self.input[start..]);
+                return Some(Ok(challenge));
             }
             State::PostEquals { .. } => {
                 trace!("eof, PostEquals");
@@ -556,6 +667,29 @@ impl<'i> Iterator for ChallengeParser<'i> {
 
 impl std::iter::FusedIterator for ChallengeParser<'_> {}
 
+/// Whether a token in the current state is the first element after its
+/// challenge's scheme, the only place a token68 may stand.
+fn first_element(challenge: Option<&ChallengeRef<'_>>, cur: Possibilities) -> bool {
+    cur.0 == P_PARAM_KEY && challenge.is_some_and(|c| c.params.is_empty() && c.token68.is_none())
+}
+
+/// Whether `value` is made only of token68's non-padding characters.
+fn is_token68(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~' | b'+' | b'/'))
+}
+
+/// Whether a first key and the `=` right after it are a token68 and its
+/// padding rather than a parameter waiting for its value.
+fn token68_padding(input: &str, challenge: &ChallengeRef<'_>, key: &Range<usize>) -> bool {
+    challenge.params.is_empty()
+        && challenge.token68.is_none()
+        && input.as_bytes().get(key.end) == Some(&b'=')
+        && is_token68(&input[key.clone()])
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{ChallengeRef, ParamValue};
@@ -578,13 +712,75 @@ mod tests {
                         ("type", ParamValue::new(0, "1")),
                         ("title", ParamValue::new(2, r#"Login to \"apps\""#)),
                     ],
+                    token68: None,
                 },
                 ChallengeRef {
                     scheme: "Basic",
                     params: vec![("realm", ParamValue::new(0, "simple")),],
+                    token68: None,
                 },
             ]
         );
+    }
+
+    fn shape(input: &str) -> Vec<(&str, Option<&str>, Vec<&str>)> {
+        crate::parse_challenges(input)
+            .unwrap_or_else(|e| panic!("{input:?}: {e}"))
+            .into_iter()
+            .map(|c| (c.scheme, c.token68, c.params.iter().map(|(k, _)| *k).collect()))
+            .collect()
+    }
+
+    #[test]
+    fn token68_stands_alone_after_its_scheme() {
+        for (input, expected) in [
+            ("Negotiate abc", vec![("Negotiate", Some("abc"), vec![])]),
+            ("Negotiate abc=", vec![("Negotiate", Some("abc="), vec![])]),
+            ("Negotiate YII/+a.b_c~d-e==", vec![("Negotiate", Some("YII/+a.b_c~d-e=="), vec![])]),
+            ("Negotiate /abc", vec![("Negotiate", Some("/abc"), vec![])]),
+            (
+                r#"Negotiate AQ==, Basic realm="x""#,
+                vec![("Negotiate", Some("AQ=="), vec![]), ("Basic", None, vec!["realm"])],
+            ),
+            (
+                r#"Basic realm="x", Negotiate AQ=="#,
+                vec![("Basic", None, vec!["realm"]), ("Negotiate", Some("AQ=="), vec![])],
+            ),
+            (
+                r#"Negotiate abc= , Digest realm="a, b", nonce="n""#,
+                vec![("Negotiate", Some("abc="), vec![]), ("Digest", None, vec!["realm", "nonce"])],
+            ),
+            ("Negotiate abc, Negotiate", vec![("Negotiate", Some("abc"), vec![]), ("Negotiate", None, vec![])]),
+            ("Negotiate, NTLM", vec![("Negotiate", None, vec![]), ("NTLM", None, vec![])]),
+            // A value after `=` makes a parameter, even after bad whitespace.
+            ("Scheme a=b", vec![("Scheme", None, vec!["a"])]),
+            ("Scheme a= b", vec![("Scheme", None, vec!["a"])]),
+            ("Scheme a=b, c=d", vec![("Scheme", None, vec!["a", "c"])]),
+        ] {
+            assert_eq!(shape(input), expected, "{input:?}");
+        }
+    }
+
+    #[test]
+    fn token68_is_refused_where_the_grammar_has_no_room_for_it() {
+        for input in [
+            "Negotiate abc=d/e",
+            "Negotiate abc==x",
+            "Negotiate abc def",
+            "Negotiate abc, def=x",
+            "Negotiate a!b",
+            "Negotiate a!b/",
+            "Negotiate abc= =",
+            "Scheme a=b, c/",
+            "Negotiate  abc",
+            "Negotiate =",
+            // Trailing whitespace ends a header value no more than after a parameter.
+            "Negotiate abc ",
+            "Negotiate abc= ",
+            "Negotiate abc== ",
+        ] {
+            assert!(crate::parse_challenges(input).is_err(), "{input:?}");
+        }
     }
 
     #[test]

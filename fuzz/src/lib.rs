@@ -11,11 +11,11 @@
 
 use log::trace;
 use nom::branch::alt;
-use nom::bytes::complete::is_a;
+use nom::bytes::complete::{is_a, tag, take_while, take_while1};
 use nom::character::complete::{char, satisfy};
-use nom::combinator::{all_consuming, consumed, map, opt, value};
+use nom::combinator::{all_consuming, consumed, eof, map, opt, peek, recognize, value};
 use nom::multi::{fold_many0, many0_count, many1, many1_count, separated_list0, separated_list1};
-use nom::sequence::{delimited, pair, preceded, separated_pair, tuple};
+use nom::sequence::{delimited, pair, preceded, separated_pair, terminated, tuple};
 
 use http_auth::{ChallengeRef, ParamValue};
 
@@ -172,15 +172,42 @@ where
 /// which we resolve by using `list0_relaxed_inner` rather than `list0_relaxed`.
 fn challenge(input: &str) -> nom::IResult<&str, ChallengeRef> {
     trace!("challenge attempt on {:?}", input);
-    map(
-        tuple((
-            token,
-            opt(preceded(char(' '), list0_relaxed_inner(auth_param))),
+    alt((
+        map(
+            tuple((token, preceded(char(' '), token68))),
+            |(scheme, token68)| ChallengeRef {
+                scheme,
+                params: Vec::new(),
+                token68: Some(token68),
+            },
+        ),
+        map(
+            tuple((
+                token,
+                opt(preceded(char(' '), list0_relaxed_inner(auth_param))),
+            )),
+            |(scheme, opt_params)| ChallengeRef {
+                scheme,
+                params: opt_params.unwrap_or_default(),
+                token68: None,
+            },
+        ),
+    ))(input)
+}
+
+/// Parses a `token68` as RFC 9110 section 11.6.1 defines it, when nothing but
+/// a list delimiter or the end follows it:
+///
+/// ```text
+/// token68 = 1*( ALPHA / DIGIT / "-" / "." / "_" / "~" / "+" / "/" ) *"="
+/// ```
+fn token68(input: &str) -> nom::IResult<&str, &str> {
+    terminated(
+        recognize(pair(
+            take_while1(|c: char| c.is_ascii_alphanumeric() || "-._~+/".contains(c)),
+            take_while(|c| c == '='),
         )),
-        |(scheme, opt_params)| ChallengeRef {
-            scheme,
-            params: opt_params.unwrap_or_default(),
-        },
+        peek(pair(ows, alt((tag(","), eof)))),
     )(input)
 }
 
@@ -233,6 +260,7 @@ mod tests {
                 vec![ChallengeRef {
                     scheme: "Scheme",
                     params: vec![("foo", ParamValue::new(1, "blah \\\" blah"),)],
+                    token68: None,
                 }]
             ))
         );
