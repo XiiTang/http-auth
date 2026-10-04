@@ -1042,12 +1042,46 @@ pub struct ServerProof {
     uri: Zeroizing<String>,
     qop: Option<Qop>,
 }
+/// What a response's `Authentication-Info` (`Proxy-Authentication-Info` from a
+/// proxy) says of the request a [`ServerProof`] answers.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ServerInfo {
+    /// The server computed `rspauth`, which only a holder of the password can;
+    /// its `nextnonce`, if any, may be adopted.
+    Proven { next_nonce: Option<String> },
+    /// The server sent no field, or, without qop, a field without `rspauth`
+    /// (RFC 7616 section 3.5 requires one only with qop). Nothing is proven,
+    /// and a `nextnonce` in it is not to be adopted.
+    Unproven,
+}
 impl ServerProof {
-    /// Verify Authentication-Info against this exact request and received body.
-    /// nextnonce is returned as private protocol state; it is never applied here.
-    pub fn verify(&self, value: &str, body: &[u8]) -> Result<Option<String>, String> {
+    /// Verify the field lines of a response's `Authentication-Info` against
+    /// this exact request and the received body. The lines are one list (RFC
+    /// 9110 section 5.3); a parameter in two of them is refused. A `nextnonce`
+    /// is returned as private protocol state and never applied here.
+    pub fn verify<'a>(
+        &self,
+        lines: impl IntoIterator<Item = &'a [u8]>,
+        body: &[u8],
+    ) -> Result<ServerInfo, String> {
         use subtle::ConstantTimeEq;
-        let input = Zeroizing::new(format!("Digest {}", value));
+        let mut joined = Zeroizing::new(String::new());
+        let mut present = false;
+        for line in lines {
+            present = true;
+            let line = std::str::from_utf8(line).map_err(|_| "authentication-info is not text")?;
+            let line = line.trim_matches([' ', '\t', ',']);
+            if !line.is_empty() {
+                if !joined.is_empty() {
+                    joined.push_str(", ");
+                }
+                joined.push_str(line);
+            }
+        }
+        if !present {
+            return Ok(ServerInfo::Unproven);
+        }
+        let input = Zeroizing::new(format!("Digest {}", joined.as_str()));
         let parsed = crate::parse_challenges(&input).map_err(|_| "invalid authentication-info")?;
         if parsed.len() != 1 {
             return Err("ambiguous authentication-info".into());
@@ -1082,6 +1116,8 @@ impl ServerProof {
             || fields.contains_key("cnonce")
         {
             return Err("unexpected authentication-info qop".into());
+        } else if !fields.contains_key("rspauth") {
+            return Ok(ServerInfo::Unproven);
         }
         let a2 = Zeroizing::new(match self.qop {
             Some(Qop::AuthInt) => {
@@ -1119,7 +1155,9 @@ impl ServerProof {
         if received.len() != expected.len() || !bool::from(received.ct_eq(&expected)) {
             return Err("rspauth mismatch".into());
         }
-        Ok(fields.get("nextnonce").map(|value| value.to_string()))
+        Ok(ServerInfo::Proven {
+            next_nonce: fields.get("nextnonce").map(|value| value.to_string()),
+        })
     }
 }
 
@@ -1286,20 +1324,22 @@ mod runtime_tests {
                     qop.as_str()
                 ));
             }
+            let proven = ServerInfo::Proven {
+                next_nonce: Some("next-2".into()),
+            };
             assert_eq!(
-                response
-                    .proof
-                    .verify(&info, &[9, 0, 128])
-                    .unwrap()
-                    .as_deref(),
-                Some("next-2")
+                response.proof.verify([info.as_bytes()], &[9, 0, 128]),
+                Ok(proven)
             );
             if qop == Some(Qop::AuthInt) {
-                assert!(response.proof.verify(&info, &[9, 0, 129]).is_err());
+                assert!(response
+                    .proof
+                    .verify([info.as_bytes()], &[9, 0, 129])
+                    .is_err());
             }
             assert!(response
                 .proof
-                .verify(&info.replace(response_hash, "00"), &[9, 0, 128])
+                .verify([info.replace(response_hash, "00").as_bytes()], &[9, 0, 128])
                 .is_err());
             assert_eq!(client.nonce_count(), 1);
             assert_eq!(client.nonce(), "nonce-1");
@@ -1312,6 +1352,80 @@ mod runtime_tests {
             assert!(client.respond_protected(&params).is_err());
             assert_eq!(client.nc, u32::MAX);
         }
+    }
+    /// The proof of the MD5 vector above, with or without qop=auth.
+    fn md5_proof(qop: Option<Qop>) -> ServerProof {
+        let mut challenge = "Digest realm=\"camera\", nonce=\"nonce-1\", algorithm=MD5".to_owned();
+        if qop.is_some() {
+            challenge.push_str(", qop=\"auth\"");
+        }
+        let parsed = crate::parse_challenges(&challenge).unwrap();
+        let mut client = DigestClient::try_from(&parsed[0]).unwrap();
+        client.select_qop(qop).unwrap();
+        let params = PasswordParams {
+            username: "user",
+            password: "p:ass",
+            method: "SET_PARAMETER",
+            uri: "rtsp://camera.invalid/media",
+            body: Some(&[0, 255, 1, 13, 10]),
+        };
+        client.respond_inner(&params, "c0ffee").unwrap().proof
+    }
+    #[test]
+    fn authentication_info_lines_are_one_list() {
+        let proof = md5_proof(Some(Qop::Auth));
+        let rspauth = "rspauth=\"c519f1e321f470bf48167692dfbe9a96\"";
+        let proven = |next: Option<&str>| {
+            Ok(ServerInfo::Proven {
+                next_nonce: next.map(str::to_owned),
+            })
+        };
+        let lines: [&[u8]; 2] = [
+            rspauth.as_bytes(),
+            b"qop=auth, nc=00000001, cnonce=\"c0ffee\"",
+        ];
+        assert_eq!(proof.verify(lines, &[]), proven(None));
+        // Empty lines and empty list elements are no parameters.
+        let lines: [&[u8]; 4] = [
+            b"",
+            b", qop=auth,",
+            rspauth.as_bytes(),
+            b" nc=00000001, , cnonce=\"c0ffee\", nextnonce=\"n2\"",
+        ];
+        assert_eq!(proof.verify(lines, &[]), proven(Some("n2")));
+        // A parameter in two lines, a line that is not text, a missing rspauth.
+        let full = format!("{rspauth}, qop=auth, nc=00000001, cnonce=\"c0ffee\"");
+        assert!(proof
+            .verify([full.as_bytes(), rspauth.as_bytes()], &[])
+            .is_err());
+        assert!(proof.verify([full.as_bytes(), b"x=\"\xff\""], &[]).is_err());
+        let lines: [&[u8]; 1] = [b"qop=auth, nc=00000001, cnonce=\"c0ffee\", nextnonce=\"n\""];
+        assert!(proof.verify(lines, &[]).is_err());
+        // No field at all proves nothing.
+        assert_eq!(
+            proof.verify(std::iter::empty(), &[]),
+            Ok(ServerInfo::Unproven)
+        );
+    }
+    #[test]
+    fn without_qop_a_nextnonce_alone_proves_nothing() {
+        let proof = md5_proof(None);
+        let lines: [&[u8]; 1] = [b"nextnonce=\"n2\""];
+        assert_eq!(proof.verify(lines, &[]), Ok(ServerInfo::Unproven));
+        let lines: [&[u8]; 2] = [
+            b"nextnonce=\"n2\"",
+            b"rspauth=\"813d5f74cbc2d11ff7903a6add0b318e\"",
+        ];
+        assert_eq!(
+            proof.verify(lines, &[9, 0, 128]),
+            Ok(ServerInfo::Proven {
+                next_nonce: Some("n2".into())
+            })
+        );
+        let lines: [&[u8]; 1] = [b"rspauth=\"00\""];
+        assert!(proof.verify(lines, &[]).is_err());
+        let lines: [&[u8]; 1] = [b"nextnonce=\"n2\", nc=00000001"];
+        assert!(proof.verify(lines, &[]).is_err());
     }
     #[test]
     fn per_request_qop_preserves_offer_on_success_and_failure() {
