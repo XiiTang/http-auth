@@ -242,7 +242,9 @@ impl DigestClient {
         self.session
     }
 
-    /// Returns the acceptable `qop` (quality of protection) values.
+    /// Returns the `qop` (quality of protection) values the server offered:
+    /// none for a challenge without `qop`, which is answered in the
+    /// [`DigestClient::rfc2069_compat`] form.
     #[inline]
     pub fn qop(&self) -> QopSet {
         self.qop
@@ -360,7 +362,7 @@ impl DigestClient {
                 body_hash.as_bytes(),
             ]);
             qop = Qop::AuthInt;
-        } else if self.qop & Qop::Auth {
+        } else if self.rfc2069_compat || self.qop & Qop::Auth {
             h_a2 = self
                 .algorithm
                 .h(&[p.method.as_bytes(), b":", p.uri.as_bytes()]);
@@ -544,9 +546,8 @@ impl TryFrom<&ChallengeRef<'_>> for DigestClient {
             buf.clear();
             false
         } else {
-            // An absent qop is treated as "auth", according to
-            // https://datatracker.ietf.org/doc/html/rfc7616#section-3.4.3
-            qop.0 |= Qop::Auth as u8;
+            // No qop is offered: the response takes the RFC 2069 form, whose
+            // A2 is that of "auth" (RFC 7616 section 3.4.3).
             true
         };
         let userhash;
@@ -991,7 +992,7 @@ mod tests {
         let ctxs: Result<Vec<_>, _> = challenges.iter().map(DigestClient::try_from).collect();
         let mut ctxs = dbg!(ctxs.unwrap());
         assert_eq!(ctxs.len(), 1);
-        assert_eq!(ctxs[0].qop.0, Qop::Auth as u8);
+        assert_eq!(ctxs[0].qop.0, 0);
         assert_eq!(ctxs[0].rfc2069_compat, true);
         let params = crate::PasswordParams {
             username: "Mufasa",
@@ -1456,6 +1457,27 @@ mod runtime_tests {
         assert_eq!(client.nonce_count(), 2);
         assert!(client.qop() & Qop::Auth);
         assert!(client.qop() & Qop::AuthInt);
+    }
+    #[test]
+    fn a_challenge_without_qop_offers_none_and_is_answered_without_one() {
+        let parsed = crate::parse_challenges("Digest realm=\"r\", nonce=\"n\"").unwrap();
+        let mut client = DigestClient::try_from(&parsed[0]).unwrap();
+        assert!(client.rfc2069_compat());
+        assert!(!(client.qop() & Qop::Auth));
+        assert!(!(client.qop() & Qop::AuthInt));
+        assert!(client.select_qop(Some(Qop::Auth)).is_err());
+        client.select_qop(None).unwrap();
+        let response = client
+            .respond_protected(&PasswordParams {
+                username: "Mufasa",
+                password: "CircleOfLife",
+                uri: "/dir/index.html",
+                method: "GET",
+                body: None,
+            })
+            .unwrap();
+        assert!(!response.authorization.contains("qop="));
+        assert!(!response.authorization.contains("cnonce="));
     }
     #[test]
     fn explicit_qop_and_duplicate_challenges_do_not_silently_fall_back() {
