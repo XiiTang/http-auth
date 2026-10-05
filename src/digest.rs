@@ -454,6 +454,143 @@ impl DigestClient {
     }
 }
 
+/// Why a [`DigestSession`] adopted no challenge from a 401 or 407.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum Unanswerable {
+    /// No challenge names the `Digest` scheme.
+    NotOffered,
+    /// Every Digest challenge offers only `auth-int`, which this session's
+    /// holder cannot answer.
+    OnlyAuthInt,
+    /// No Digest challenge can be read, such as one naming only unknown
+    /// algorithms.
+    Invalid,
+}
+
+/// A Digest client across the requests it answers (RFC 7616 section 3.3), as
+/// curl keeps one per connection and httpx one per auth flow: the challenge it
+/// adopted, whose nonce each later request reuses with the next count, until
+/// the server challenges again or proves a `nextnonce`.
+///
+/// A holder answers a 401 or 407 by passing its challenges to
+/// [`DigestSession::challenged`] and sending the request again with
+/// [`DigestSession::respond`]'s answer; later requests carry an answer from
+/// the start. What the server replies goes to [`DigestSession::replied`].
+pub struct DigestSession {
+    client: Option<DigestClient>,
+    auth_int: bool,
+}
+
+impl std::fmt::Debug for DigestSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DigestSession")
+            .field("adopted", &self.client.is_some())
+            .field("auth_int", &self.auth_int)
+            .finish()
+    }
+}
+
+impl DigestSession {
+    /// A session without a challenge. `auth_int` says whether its holder can
+    /// answer `auth-int`: it has each request's whole body when it answers,
+    /// and each reply's whole body when it checks the server's proof, whose
+    /// hash covers it.
+    pub fn new(auth_int: bool) -> Self {
+        Self {
+            client: None,
+            auth_int,
+        }
+    }
+
+    /// Adopts the first Digest challenge among `values` (the
+    /// `WWW-Authenticate` or `Proxy-Authenticate` field lines of a 401 or
+    /// 407) this client can answer, as RFC 7616 section 3.7 has a client do:
+    /// one it cannot read, such as one naming an unknown algorithm, is passed
+    /// over, and so is one offering only `auth-int` when the holder cannot
+    /// answer it. Any challenge adopted before is dropped, since the server
+    /// refused it: its nonce went stale, or the credential was wrong.
+    pub fn challenged<'a>(
+        &mut self,
+        values: impl IntoIterator<Item = &'a str>,
+    ) -> Result<(), Unanswerable> {
+        self.client = None;
+        let (mut offered, mut only_auth_int) = (false, false);
+        for value in values {
+            let Ok(parsed) = crate::parse_challenges(value) else {
+                continue;
+            };
+            for challenge in parsed {
+                if !challenge.scheme.eq_ignore_ascii_case("Digest") {
+                    continue;
+                }
+                offered = true;
+                let Ok(client) = DigestClient::try_from(&challenge) else {
+                    continue;
+                };
+                if client.rfc2069_compat()
+                    || client.qop() & Qop::Auth
+                    || (self.auth_int && client.qop() & Qop::AuthInt)
+                {
+                    self.client = Some(client);
+                    return Ok(());
+                }
+                only_auth_int = true;
+            }
+        }
+        Err(if only_auth_int {
+            Unanswerable::OnlyAuthInt
+        } else if offered {
+            Unanswerable::Invalid
+        } else {
+            Unanswerable::NotOffered
+        })
+    }
+
+    /// Answers one request with the adopted challenge and the next count of
+    /// its nonce, or `None` before any challenge was adopted. `auth` is
+    /// answered where offered, as curl and httpx prefer it; `auth-int` only
+    /// where it is the one offered, which needs `p.body`.
+    pub fn respond(&mut self, p: &PasswordParams) -> Result<Option<DigestResponse>, String> {
+        let Some(client) = &mut self.client else {
+            return Ok(None);
+        };
+        let qop = if client.rfc2069_compat() {
+            None
+        } else if client.qop() & Qop::Auth {
+            Some(Qop::Auth)
+        } else if p.body.is_some() {
+            Some(Qop::AuthInt)
+        } else {
+            return Err("the challenge offers only auth-int, which needs the request body".into());
+        };
+        client.respond_with_qop_protected(p, qop).map(Some)
+    }
+
+    /// Takes the reply to a request answered with `proof`: every field line of
+    /// its `Authentication-Info` (`Proxy-Authentication-Info` from a proxy)
+    /// and its body. A proof it carries must verify; a `nextnonce` it proves
+    /// is adopted for the requests that follow, and one it does not prove is
+    /// not.
+    pub fn replied<'a>(
+        &mut self,
+        proof: &ServerProof,
+        lines: impl IntoIterator<Item = &'a [u8]>,
+        body: &[u8],
+    ) -> Result<ServerInfo, String> {
+        let info = proof.verify(lines, body)?;
+        if let (
+            ServerInfo::Proven {
+                next_nonce: Some(next),
+            },
+            Some(client),
+        ) = (&info, &mut self.client)
+        {
+            client.adopt_verified_nonce(next)?;
+        }
+        Ok(info)
+    }
+}
+
 impl TryFrom<&ChallengeRef<'_>> for DigestClient {
     type Error = String;
 
@@ -1507,5 +1644,122 @@ mod runtime_tests {
             let parsed = crate::parse_challenges(&header).unwrap();
             assert!(DigestClient::try_from(&parsed[0]).is_err());
         }
+    }
+
+    fn session_params(body: Option<&[u8]>) -> PasswordParams<'_> {
+        PasswordParams {
+            username: "user",
+            password: "secret",
+            method: "DESCRIBE",
+            uri: "rtsp://camera.invalid/media",
+            body,
+        }
+    }
+    fn param<'a>(header: &'a str, key: &str) -> &'a str {
+        let rest = &header[header.find(&format!(" {}=", key)).unwrap() + key.len() + 2..];
+        let rest = rest.strip_prefix('"').unwrap_or(rest);
+        &rest[..rest.find(['"', ',']).unwrap_or(rest.len())]
+    }
+    #[test]
+    fn a_session_adopts_the_first_challenge_it_can_answer() {
+        let mut session = DigestSession::new(false);
+        assert_eq!(
+            session.challenged(["Basic realm=\"r\""]),
+            Err(Unanswerable::NotOffered)
+        );
+        assert_eq!(
+            session.challenged(["Digest realm=\"r\", nonce=\"n\", algorithm=SHA-999"]),
+            Err(Unanswerable::Invalid)
+        );
+        let only_auth_int = "Digest realm=\"r\", nonce=\"n\", qop=\"auth-int\"";
+        assert_eq!(
+            session.challenged([only_auth_int]),
+            Err(Unanswerable::OnlyAuthInt)
+        );
+        assert!(session.respond(&session_params(None)).unwrap().is_none());
+        // Passed over for a later one, in another field line or the same.
+        session
+            .challenged([
+                only_auth_int,
+                "Digest realm=\"r\", nonce=\"n\", algorithm=SHA-999, Digest realm=\"r\", nonce=\"later\", algorithm=SHA-256, qop=\"auth-int,auth\"",
+            ])
+            .unwrap();
+        let answer = session
+            .respond(&session_params(Some(b"body")))
+            .unwrap()
+            .unwrap();
+        assert_eq!(param(&answer.authorization, "nonce"), "later");
+        assert_eq!(param(&answer.authorization, "algorithm"), "SHA-256");
+        // auth is preferred even with the body held.
+        assert_eq!(param(&answer.authorization, "qop"), "auth");
+        // A holder of whole bodies answers auth-int where it is all offered.
+        let mut session = DigestSession::new(true);
+        session.challenged([only_auth_int]).unwrap();
+        assert!(session.respond(&session_params(None)).is_err());
+        let answer = session
+            .respond(&session_params(Some(b"body")))
+            .unwrap()
+            .unwrap();
+        assert_eq!(param(&answer.authorization, "qop"), "auth-int");
+    }
+    #[test]
+    fn a_session_counts_its_nonce_and_adopts_only_a_proven_next_one() {
+        let mut session = DigestSession::new(false);
+        session
+            .challenged(["Digest realm=\"r\", nonce=\"n1\", qop=\"auth\""])
+            .unwrap();
+        let first = session.respond(&session_params(None)).unwrap().unwrap();
+        let second = session.respond(&session_params(None)).unwrap().unwrap();
+        for (answer, nc) in [(&first, "00000001"), (&second, "00000002")] {
+            assert_eq!(param(&answer.authorization, "nonce"), "n1");
+            assert_eq!(param(&answer.authorization, "nc"), nc);
+        }
+        let md5 = Algorithm::Md5;
+        let cnonce = param(&second.authorization, "cnonce");
+        let rspauth = md5.h(&[
+            md5.h(&[b"user:r:secret"]).as_bytes(),
+            b":n1:00000002:",
+            cnonce.as_bytes(),
+            b":auth:",
+            md5.h(&[b":rtsp://camera.invalid/media"]).as_bytes(),
+        ]);
+        let info = format!(
+            "rspauth=\"{}\", qop=auth, nc=00000002, cnonce=\"{}\", nextnonce=\"n2\"",
+            rspauth, cnonce
+        );
+        assert_eq!(
+            session.replied(&second.proof, [info.as_bytes()], &[]),
+            Ok(ServerInfo::Proven {
+                next_nonce: Some("n2".into())
+            })
+        );
+        let third = session.respond(&session_params(None)).unwrap().unwrap();
+        assert_eq!(param(&third.authorization, "nonce"), "n2");
+        assert_eq!(param(&third.authorization, "nc"), "00000001");
+        // A forged proof fails and adopts nothing.
+        let forged = info.replace(&rspauth, &"0".repeat(32));
+        assert!(session
+            .replied(&second.proof, [forged.as_bytes()], &[])
+            .is_err());
+        // Without qop, a nextnonce alone proves nothing and is not adopted.
+        let mut session = DigestSession::new(false);
+        session
+            .challenged(["Digest realm=\"r\", nonce=\"n1\""])
+            .unwrap();
+        let answer = session.respond(&session_params(None)).unwrap().unwrap();
+        let lines: [&[u8]; 1] = [b"nextnonce=\"n2\""];
+        assert_eq!(
+            session.replied(&answer.proof, lines, &[]),
+            Ok(ServerInfo::Unproven)
+        );
+        let next = session.respond(&session_params(None)).unwrap().unwrap();
+        assert_eq!(param(&next.authorization, "nonce"), "n1");
+        // A new challenge replaces the adopted one, and its count starts anew.
+        session
+            .challenged(["Digest realm=\"r\", nonce=\"n3\", stale=true, qop=\"auth\""])
+            .unwrap();
+        let fresh = session.respond(&session_params(None)).unwrap().unwrap();
+        assert_eq!(param(&fresh.authorization, "nonce"), "n3");
+        assert_eq!(param(&fresh.authorization, "nc"), "00000001");
     }
 }
