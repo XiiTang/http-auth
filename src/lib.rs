@@ -96,7 +96,7 @@ pub use crate::basic::BasicClient;
 
 #[cfg(feature = "digest-scheme")]
 #[cfg_attr(docsrs, doc(cfg(feature = "digest-scheme")))]
-pub use crate::digest::{DigestClient, DigestSession};
+pub use crate::digest::DigestClient;
 
 use crate::table::{char_classes, C_ESCAPABLE, C_OWS, C_QDTEXT, C_TCHAR};
 
